@@ -39,6 +39,7 @@ dependencies = [
   "portalocker>=2.4.0",
   "openpyxl>=3.0.9",
   "ruff>=0.15.0",
+  "loguru>=0.7.3",
 ]
 
 [project.urls]
