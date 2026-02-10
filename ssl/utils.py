@@ -5,17 +5,22 @@ import cv2
 import numpy as np
 import torch
 
+
 def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
+
 
 def set_seed(seed):
     torch.manual_seed(seed)
     random.seed(seed)
     np.random.seed(seed)
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = True  # sometimes not PERFECTLY deterministic when True, but major speedup during training
+    torch.backends.cudnn.benchmark = (
+        True  # sometimes not PERFECTLY deterministic when True, but major speedup during training
+    )
+
 
 def load_video(fpath):
     if not os.path.exists(fpath):

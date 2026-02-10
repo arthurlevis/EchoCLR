@@ -1,5 +1,6 @@
 import torch
 
+
 class SimCLR(torch.nn.Module):
     # Adapted from https://github.com/Spijkervet/SimCLR/blob/master/simclr/simclr.py
     def __init__(self, encoder, projection_dim, n_features, frame_reordering=False):
