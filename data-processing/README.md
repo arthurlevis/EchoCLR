@@ -6,7 +6,7 @@ Scripts to prepare the EchoCLR dataset from `nov_dec_data_collection` video data
 
 The `prepare_dataset.py` script:
 - ✅ Extracts **only PLAX videos** from `robot_scan/plax/` folders
-- ✅ Includes **all rosbag folders** for each patient (not just latest)
+- ✅ Takes the **latest rosbag** if multiple exist per patient
 - ✅ Converts **MP4 → AVI** (MJPEG codec for fast loading)
 - ✅ Uses **patient IDs** (e.g., `bold-meals-travel`) as `acc_num`
 - ✅ Creates **train/val/test splits** at patient level
@@ -20,18 +20,18 @@ annotation_video/nov_dec_data_collection/
 ├── bold-meals-travel/
 │   ├── manual_scan/              # IGNORED
 │   └── robot_scan/
-│       ├── plax/                 # ✅ ALL VIDEOS EXTRACTED
+│       ├── plax/                 # ✅ EXTRACTED
 │       │   ├── rosbag_20251201_144645/
-│       │   │   └── rosbag_20251201_144645_0.mp4  # ✅ Included
-│       │   └── rosbag_20251201_145107/
-│       │       └── rosbag_20251201_145107_0.mp4  # ✅ Included
+│       │   │   └── rosbag_20251201_144645_0.mp4
+│       │   └── rosbag_20251201_145107/  # ← Latest, will be used
+│       │       └── rosbag_20251201_145107_0.mp4
 │       ├── apical/               # IGNORED
 │       └── psax/                 # IGNORED
 ├── brave-spies-smell/
 │   └── robot_scan/
 │       └── plax/
 │           └── rosbag_20251126_150022/
-│               └── rosbag_20251126_150022_0.mp4  # ✅ Included
+│               └── rosbag_20251126_150022_0.mp4
 └── ...
 ```
 
@@ -40,9 +40,8 @@ annotation_video/nov_dec_data_collection/
 ```
 data_dir/
 ├── videos/
-│   ├── bold-meals-travel_rosbag_20251201_144645_0.avi  # video_num=0
-│   ├── bold-meals-travel_rosbag_20251201_145107_0.avi  # video_num=1
-│   ├── brave-spies-smell_rosbag_20251126_150022_0.avi  # video_num=0
+│   ├── bold-meals-travel_rosbag_20251201_145107_0.avi
+│   ├── brave-spies-smell_rosbag_20251126_150022_0.avi
 │   └── ...
 ├── train.csv
 ├── val.csv
@@ -63,7 +62,7 @@ uv run python data-processing/check_video_folder.py \
 This will show:
 - ✅ Number of valid patients with PLAX videos
 - ⚠️ Patients missing PLAX folders
-- 🔄 Patients with multiple rosbag folders (all will be used)
+- 🔄 Patients with multiple rosbag folders (shows which will be used)
 - 📊 Total videos that will be processed
 - 🔗 Multi-instance learning statistics
 
@@ -77,24 +76,19 @@ uv run python data-processing/prepare_dataset.py \
     --output_dir data/echoclr_dataset
 ```
 
-#### Custom Split Ratios
+#### Custom Number of Workers (Multiprocessing)
 
 ```bash
 uv run python data-processing/prepare_dataset.py \
     --input_dir /path/to/annotation_video/nov_dec_data_collection \
     --output_dir data/echoclr_dataset \
-    --train_ratio 0.80 \
-    --val_ratio 0.10 \
-    --test_ratio 0.10
+    --num_workers 8
 ```
 
-#### Parallel Workers
-
+Recommended number of workers: `Cores per socket × Sockets` :
 ```bash
-uv run python data-processing/prepare_dataset.py \
-    --input_dir /path/to/annotation_video/nov_dec_data_collection \
-    --output_dir data/echoclr_dataset \
-    --num_workers 8  # Use 8 parallel workers (default: 4)
+lscpu | grep "Core(s) per socket"
+lscpu | grep "Socket(s)"
 ```
 
 ## CSV Format
@@ -111,39 +105,23 @@ Each CSV file contains:
 
 ## Multi-Instance Learning
 
-Patients with **multiple PLAX videos** (across all rosbag folders) will have multiple rows with the same `acc_num`. EchoCLR will use these as positive pairs for contrastive learning.
-
-This includes:
-- Multiple videos within a single rosbag folder
-- Videos from different rosbag folders for the same patient
+Patients with **multiple PLAX videos** in the latest rosbag folder will have multiple rows with the same `acc_num`. EchoCLR will use these as positive pairs for contrastive learning.
 
 Example:
 ```csv
 fpath,acc_num,plax_prob,video_num,label
 patient1_rosbag_20251201_120000_0.avi,patient1,1.0,0,0
-patient1_rosbag_20251201_120000_1.avi,patient1,1.0,1,0  # Same patient, same rosbag
-patient1_rosbag_20251201_150000_0.avi,patient1,1.0,2,0  # Same patient, different rosbag
+patient1_rosbag_20251201_120000_1.avi,patient1,1.0,1,0  # Same patient!
 patient2_rosbag_20251202_130000_0.avi,patient2,1.0,0,0
 ```
 
 ## Video Conversion
 
 Videos are converted from MP4 to AVI using **FFmpeg** with **MJPEG codec**:
-- Fast parallel conversion using configurable number of workers (default: 4)
+- Fast parallel conversion using all CPU cores
 - MJPEG provides fast decoding during training (important for data loading performance)
 - Files are ~50% larger than MP4, but this is a worthwhile trade-off for training speed
 - Quality setting: `-q:v 2` (high quality)
-
-### Why CPU-only (no GPU encoding)?
-
-GPU encoding (NVENC) only supports H.264/HEVC, not MJPEG. Since we specifically use MJPEG for fast training-time decoding, GPU encoding would defeat the purpose. CPU-based FFmpeg with MJPEG is the optimal choice for this workflow.
-
-### Performance Tuning
-
-- **Default**: 4 workers balances speed and system load
-- **More workers**: Use `--num_workers 8` or higher if you have many CPU cores and fast I/O
-- **Fewer workers**: Use `--num_workers 2` if system is under heavy load or I/O is slow
-- **Rule of thumb**: Set to number of physical CPU cores for best performance
 
 ## Requirements
 
@@ -161,39 +139,5 @@ Dependencies are managed via `pyproject.toml`:
 
 ```bash
 cd /home/arthur/dev/EchoCLR
-uv sync  # Install dependencies
+uv sync 
 ```
-
-Required packages:
-- `pandas` (CSV generation)
-- `tqdm` (progress bars)
-- `loguru` (logging)
-
-## Troubleshooting
-
-### No PLAX videos found
-
-**Issue:** Script reports "No PLAX videos found"
-
-**Solution:** Verify:
-1. Input directory path is correct
-2. Structure matches expected format (`patient/robot_scan/plax/rosbag_*/`)
-3. Videos are `.mp4` files (not `.avi` already)
-
-### Conversion errors
-
-**Issue:** FFmpeg conversion fails
-
-**Solution:**
-1. Verify FFmpeg is installed: `which ffmpeg`
-2. Check FFmpeg can read the MP4: `ffmpeg -i video.mp4`
-3. Verify source video is not corrupted
-4. Check disk space (AVI files are ~50% larger than MP4)
-
-### Missing patients in splits
-
-**Issue:** Some patients not appearing in train/val/test
-
-**Solution:**
-- Patients without valid `robot_scan/plax/rosbag_*/` folders are skipped
-- Check warnings during execution: `⚠️  No PLAX folder for patient X`
