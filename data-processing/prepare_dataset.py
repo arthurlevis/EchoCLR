@@ -338,7 +338,7 @@ def main():
     parser.add_argument(
         "--train_ratio",
         type=float,
-        default=0.75,
+        default=0.8,
         help="Fraction of patients for training (default: 0.75)",
     )
     parser.add_argument(
@@ -350,7 +350,7 @@ def main():
     parser.add_argument(
         "--test_ratio",
         type=float,
-        default=0.15,
+        default=0.10,
         help="Fraction of patients for testing (default: 0.15)",
     )
     parser.add_argument(
