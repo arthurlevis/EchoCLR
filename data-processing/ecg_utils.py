@@ -43,7 +43,7 @@ def compute_clip_indices_between_peaks(
 
 
 def validate_clip_bounds(
-    clips: list[tuple[int, int, int]], total_frames: int
+    clips: list[tuple[int, int, int]], total_frames: int, offset: int = 0
 ) -> list[tuple[int, int, int]]:
     """Filter clips that exceed dataset boundaries."""
-    return [(s, e, sub) for s, e, sub in clips if s >= 0 and e <= total_frames]
+    return [(s, e, sub) for s, e, sub in clips if s >= offset and e <= offset + total_frames]
