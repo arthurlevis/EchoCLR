@@ -13,6 +13,8 @@ Run multiple times with different --input and --patient-id to build dataset incr
 """
 
 import argparse
+import logging
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +31,11 @@ from video_utils import save_video
 from s3_utils import open_zarr
 from image_processing import map_ultrasound_sectors_batch, resize_frames
 from empty_frame_filtering import detect_empty_frames
+
+# Suppress aiohttp unclosed connector warnings
+logging.getLogger("asyncio").setLevel(logging.CRITICAL)
+warnings.filterwarnings("ignore", message="Unclosed client session")
+warnings.filterwarnings("ignore", message="Unclosed connector")
 
 
 ECG_TOPIC = "ge_ultrasound_ecg_samples"
@@ -146,11 +153,18 @@ def main():
 
     obs_data = z[obs_key]["data"]
     total_frames = obs_data.shape[0]
+    frame_offset = 0
 
     # Limit frames if requested
     if args.num_samples is not None:
-        total_frames = min(total_frames, args.num_samples)
-        print(f"Using first {total_frames} frames (--num-samples)")
+        n = abs(args.num_samples)
+        if args.num_samples < 0:
+            frame_offset = max(0, total_frames - n)
+            total_frames = min(n, total_frames)
+            print(f"Using last {total_frames} frames (--num-samples)")
+        else:
+            total_frames = min(total_frames, n)
+            print(f"Using first {total_frames} frames (--num-samples)")
     else:
         print(f"Zarr has {total_frames} frames")
 
@@ -170,7 +184,7 @@ def main():
     clip_indices = compute_clip_indices_between_peaks(
         r_peak_times, frame_timestamps, subsample=args.subsample
     )
-    clip_indices = validate_clip_bounds(clip_indices, total_frames)
+    clip_indices = validate_clip_bounds(clip_indices, total_frames, offset=frame_offset)
     print(f"Valid clips: {len(clip_indices)}")
 
     if len(clip_indices) == 0:
@@ -206,23 +220,20 @@ def main():
         if clip.ndim == 4 and clip.shape[-1] == 1:
             clip = clip.squeeze(-1)
 
-        # Filter empty frames
-        is_empty = detect_empty_frames(clip)
-        if is_empty.any():
-            n_skipped += 1
-            if args.save_empty_clips:
-                # Save to empty/ folder for debugging
-                clip_transformed = map_ultrasound_sectors_batch(clip, sector_half_angle_deg=args.sector_angle)
-                clip_resized = resize_frames(clip_transformed, output_size)
-                filename = f"{args.patient_id}_clip_{clip_idx}.avi"
-                save_video(clip_resized, str(empty_dir / filename), fps=args.fps / subsample)
-            continue
-
         # Apply polar sector transform
         clip = map_ultrasound_sectors_batch(clip, sector_half_angle_deg=args.sector_angle)
 
         # Resize to target size
         clip = resize_frames(clip, output_size)
+
+        # Filter empty frames
+        is_empty = detect_empty_frames(clip)
+        if is_empty.any():
+            n_skipped += 1
+            if args.save_empty_clips:
+                filename = f"{args.patient_id}_clip_{clip_idx}.avi"
+                save_video(clip, str(empty_dir / filename), fps=args.fps / subsample)
+            continue
 
         filename = f"{args.patient_id}_clip_{clip_idx}.avi"
         save_video(clip, str(videos_dir / filename), fps=args.fps / subsample)
@@ -237,7 +248,10 @@ def main():
 
     # Append to dataset.csv
     new_df = pd.DataFrame(new_records, columns=CSV_COLUMNS)
-    combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+    if existing_df.empty:
+        combined_df = new_df
+    else:
+        combined_df = pd.concat([existing_df, new_df], ignore_index=True)
     combined_df.to_csv(csv_path, index=False)
 
     print(f"\nVideos created at: {output_path}")
