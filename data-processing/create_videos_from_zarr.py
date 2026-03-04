@@ -32,6 +32,7 @@ from ecg_utils import (
     validate_clip_bounds,
 )
 # from video_utils import save_video  # Switched to numpy for faster loading
+from video_utils import save_video  # For AVI debug output
 from s3_utils import open_zarr
 from image_processing import map_ultrasound_sectors_batch, resize_frames
 from empty_frame_filtering import detect_empty_frames
@@ -236,12 +237,15 @@ def main():
         n_saved = 0
         pose_map = {}  # clip filename -> pose filename
         for clip_idx, (start, end, subsample) in tqdm(enumerate(clip_indices), total=len(clip_indices), desc="Saving poses"):
+            clip_filename = f"{args.patient_id}_clip_{clip_idx}.npy"
+            # Only save pose if clip exists
+            if not (videos_dir / clip_filename).exists():
+                continue
             last_frame_idx = end - 1
             if last_frame_idx < pose_data.shape[0]:
                 rel_pose = compute_relative_pose_6d(pose_data[last_frame_idx], reference_pose)
                 pose_filename = f"{args.patient_id}_pose_{clip_idx}.npy"
                 np.save(str(poses_dir / pose_filename), rel_pose)
-                clip_filename = f"{args.patient_id}_clip_{clip_idx}.npy"
                 pose_map[clip_filename] = pose_filename
                 n_saved += 1
         
@@ -286,14 +290,16 @@ def main():
             if is_empty.any():
                 n_skipped += 1
                 if args.save_empty_clips:
-                    filename = f"{args.patient_id}_clip_{clip_idx}.npy"
-                    np.save(str(empty_dir / filename), clip[..., np.newaxis])  # (T,H,W,1)
-                    # save_video(clip, str(empty_dir / filename.replace('.npy', '.avi')), fps=args.fps / subsample)
+                    save_video(clip, str(empty_dir / f"{args.patient_id}_clip_{clip_idx}.avi"), fps=args.fps / subsample)
                 continue
 
             filename = f"{args.patient_id}_clip_{clip_idx}.npy"
             np.save(str(videos_dir / filename), clip[..., np.newaxis])  # (T,H,W,1)
-            # save_video(clip, str(videos_dir / filename.replace('.npy', '.avi')), fps=args.fps / subsample)
+            
+            # Also save AVI for debugging
+            avi_dir = output_path / "videos-avi"
+            avi_dir.mkdir(parents=True, exist_ok=True)
+            save_video(clip, str(avi_dir / f"{args.patient_id}_clip_{clip_idx}.avi"), fps=args.fps / subsample)
 
             # Save pose (last frame, relative to first frame of zarr)
             pose_filename = None
