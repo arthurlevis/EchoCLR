@@ -49,3 +49,8 @@ history.csv
 # Data
 *.mcap
 *.zarr
+
+paper.pdf
+paper.txt
+3D_MODELS_FOR_PRETRAINING.md
+debug/
