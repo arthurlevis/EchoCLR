@@ -109,10 +109,24 @@ def main(args):
 
             if torch.isnan(loss):
                 print(f"NaN loss at batch {i}, skipping")
+                optimizer.zero_grad()
                 continue
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
+            
+            # Check for NaN gradients
+            nan_grads = False
+            for p in model.parameters():
+                if p.grad is not None and torch.isnan(p.grad).any():
+                    nan_grads = True
+                    break
+            
+            if nan_grads:
+                print(f"NaN gradients at batch {i}, skipping")
+                optimizer.zero_grad()
+                continue
+                
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
@@ -164,7 +178,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--n_gpu", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--temperature", type=float, default=0.05)
+    parser.add_argument("--temperature", type=float, default=0.5)
     parser.add_argument("--projection_dim", type=int, default=128)
     parser.add_argument("--lr", type=float, default=0.1)
     parser.add_argument("--num_epochs", type=int, default=300)
