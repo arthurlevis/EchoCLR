@@ -5,7 +5,7 @@ Create videos from zarr file and append to dataset.csv.
 Output structure:
     output_dir/
     ├── videos/
-    │   ├── patient_001_clip_0.avi
+    │   ├── patient_001_clip_0.npy
     │   └── ...
     └── dataset.csv
 
@@ -28,7 +28,7 @@ from ecg_utils import (
     compute_clip_indices_between_peaks,
     validate_clip_bounds,
 )
-from video_utils import save_video
+# from video_utils import save_video  # Switched to numpy for faster loading
 from s3_utils import open_zarr
 from image_processing import map_ultrasound_sectors_batch, resize_frames
 from empty_frame_filtering import detect_empty_frames
@@ -239,12 +239,14 @@ def main():
             if is_empty.any():
                 n_skipped += 1
                 if args.save_empty_clips:
-                    filename = f"{args.patient_id}_clip_{clip_idx}.avi"
-                    save_video(clip, str(empty_dir / filename), fps=args.fps / subsample)
+                    filename = f"{args.patient_id}_clip_{clip_idx}.npy"
+                    np.save(str(empty_dir / filename), clip[..., np.newaxis])  # (T,H,W,1)
+                    # save_video(clip, str(empty_dir / filename.replace('.npy', '.avi')), fps=args.fps / subsample)
                 continue
 
-            filename = f"{args.patient_id}_clip_{clip_idx}.avi"
-            save_video(clip, str(videos_dir / filename), fps=args.fps / subsample)
+            filename = f"{args.patient_id}_clip_{clip_idx}.npy"
+            np.save(str(videos_dir / filename), clip[..., np.newaxis])  # (T,H,W,1)
+            # save_video(clip, str(videos_dir / filename.replace('.npy', '.avi')), fps=args.fps / subsample)
 
             new_records.append({
                 "acc_num": args.patient_id,
