@@ -3,164 +3,164 @@ import os
 import shutil
 
 import argparse
-import pandas as pd
 import torch
 import torchvision
 import tqdm
+from torch.utils.tensorboard import SummaryWriter
 
 from dataset import EchoDataset
-from losses import NT_Xent
+from losses import NT_Xent, compute_val_loss
 from model import SimCLR
 from utils import seed_worker, set_seed
 
 
 def main(args):
-    # Set up output directory structure, removing existing model directory if present
     if not os.path.isdir(args.out_dir):
         os.mkdir(args.out_dir)
 
-    model_dir = os.path.join(args.out_dir, args.model_name)
-
+    model_dir = os.path.join(args.out_dir, args.experiment_name)
     if os.path.isdir(model_dir):
         shutil.rmtree(model_dir)
     os.mkdir(model_dir)
 
-    # Initialize training history CSV file for logging metrics
-    history = pd.DataFrame({"epoch": [], "loss": []})
-    history.to_csv(os.path.join(model_dir, "history.csv"), index=False)
-
+    writer = SummaryWriter(log_dir=model_dir)
+    with open(os.path.join(model_dir, "args.txt"), "w") as f:
+        for k, v in vars(args).items():
+            f.write(f"{k}: {v}\n")
     device = "cuda:0"
-
-    # Set random seed for reproducibility
     set_seed(0)
 
-    # Create dataset and dataloader for contrastive learning
-    train_dataset = EchoDataset(
-        data_dir=args.data_dir,
-        split="train",
-        clip_len=args.clip_len,
-        sampling_rate=args.sampling_rate,
-        multi_instance=args.multi_instance,
-        frame_reordering=args.frame_reordering,
-    )
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
+    # Create dataloaders
+    loader_kwargs = dict(
         batch_size=args.n_gpu * args.batch_size,
-        shuffle=True,
         num_workers=12,
         worker_init_fn=seed_worker,
         drop_last=True,
     )
-
-    # Initialize SimCLR model with R3D-18 encoder and projection head
-    encoder = torchvision.models.video.r3d_18(pretrained=False)
-    model = SimCLR(
-        encoder=encoder,
-        projection_dim=args.projection_dim,
-        n_features=encoder.fc.in_features,
+    train_dataset = EchoDataset(
+        data_dir=args.data_dir, split="train", clip_len=args.clip_len,
+        sampling_rate=args.sampling_rate, multi_instance=args.multi_instance,
         frame_reordering=args.frame_reordering,
     )
+    val_dataset = EchoDataset(
+        data_dir=args.data_dir, split="val", clip_len=args.clip_len,
+        sampling_rate=args.sampling_rate, multi_instance=args.multi_instance,
+        frame_reordering=args.frame_reordering,
+    )
+    train_loader = torch.utils.data.DataLoader(train_dataset, shuffle=True, **loader_kwargs)
+    val_loader = torch.utils.data.DataLoader(val_dataset, shuffle=False, **loader_kwargs)
 
-    # Wrap model in DataParallel for multi-GPU training if applicable
+    # Initialize model
+    # ⚠️  NOTE: s3d requires longer clips (aggressive temporal pooling), but this increases the number of permutations in frame reordering.
+    BACKBONES = {
+        "r3d_18": torchvision.models.video.r3d_18,
+        "s3d": torchvision.models.video.s3d,
+        "r2plus1d_18": torchvision.models.video.r2plus1d_18,
+        "mc3_18": torchvision.models.video.mc3_18,
+    }
+    encoder = BACKBONES[args.backbone](weights=None)
+    # Get encoder output dim: fc (fully connected), called classifier for s3d 
+    if hasattr(encoder, "fc"):
+        n_features = encoder.fc.in_features if hasattr(encoder.fc, "in_features") else encoder.fc[1].in_features
+    else:
+        n_features = encoder.classifier[1].in_channels
+    model = SimCLR(
+        encoder=encoder, projection_dim=args.projection_dim,
+        n_features=n_features, frame_reordering=args.frame_reordering,
+    )
     if args.n_gpu > 1:
         model = torch.nn.DataParallel(model, device_ids=list(range(args.n_gpu))).to(device)
     else:
         model = model.to(device)
     print(model)
 
-    # Initialize Adam optimizer with specified learning rate
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-
-    # Contrastive loss (NT-Xent)
     loss_fxn = NT_Xent(args.batch_size, args.temperature, world_size=args.n_gpu)
+    cls_loss_fxn = torch.nn.CrossEntropyLoss() if args.frame_reordering else None
 
-    # Frame reordering loss (cross-entropy)
-    if args.frame_reordering:
-        cls_loss_fxn = torch.nn.CrossEntropyLoss()
+    best_val_loss = float("inf")
+    patience_counter = 0
 
-    # Main training loop over epochs
     for epoch in range(1, args.num_epochs + 1):
+        model.train()
         running_loss = 0.0
         pbar = tqdm.tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch}")
 
-        # Process each batch
         for i, batch in pbar:
             if args.frame_reordering:
                 x_i, x_j, t_i, t_j = batch
-                x_i = x_i.to(device)
-                x_j = x_j.to(device)
-                t_i = t_i.to(device)
-                t_j = t_j.to(device)
-
-                h_i, h_j, z_i, z_j, t_hat_i, t_hat_j = model.forward(x_i, x_j)  # foward pass
-
+                x_i, x_j = x_i.to(device), x_j.to(device)
+                t_i, t_j = t_i.to(device), t_j.to(device)
+                _, _, z_i, z_j, t_hat_i, t_hat_j = model(x_i, x_j)
                 loss = loss_fxn(z_i, z_j) + cls_loss_fxn(
                     torch.cat([t_hat_i, t_hat_j]), torch.cat([t_i, t_j])
-                )  # compute loss
+                )
             else:
                 x_i, x_j = batch
-                x_i = x_i.to(device)
-                x_j = x_j.to(device)
-
-                h_i, h_j, z_i, z_j = model.forward(x_i, x_j)
-
+                x_i, x_j = x_i.to(device), x_j.to(device)
+                _, _, z_i, z_j = model(x_i, x_j)
                 loss = loss_fxn(z_i, z_j)
 
-            # Backward pass
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            optimizer.step()  # update weights
-
-            running_loss += loss.item()  # accumulate loss for logging
-
+            optimizer.step()
+            running_loss += loss.item()
             pbar.set_postfix({"loss": running_loss / (i + 1)})
 
-        # Log epoch metrics to history CSV file
-        current_metrics = pd.DataFrame({"epoch": [epoch], "loss": [running_loss / (i + 1)]})
-        current_metrics.to_csv(
-            os.path.join(model_dir, "history.csv"), mode="a", header=False, index=False
-        )
+        train_loss = running_loss / len(train_loader)
+        val_loss = compute_val_loss(model, val_loader, loss_fxn, cls_loss_fxn, device, args.frame_reordering)
 
-        # Save model checkpoint at specified frequency
+        writer.add_scalar("Loss/train", train_loss, epoch)
+        writer.add_scalar("Loss/val", val_loss, epoch)
+        print(f"Epoch {epoch}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}")
+
+        # Save checkpoint every save_freq epochs
         if epoch % args.save_freq == 0:
             torch.save(
-                {
-                    "weights": model.module.state_dict()
-                    if isinstance(model, torch.nn.DataParallel)
-                    else model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                },
+                {"weights": model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict(),
+                 "optimizer": optimizer.state_dict()},
                 os.path.join(model_dir, f"chkpt_epoch-{epoch}.pt"),
             )
 
+        # Save best model and check early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save(
+                {"weights": model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict(),
+                 "optimizer": optimizer.state_dict()},
+                os.path.join(model_dir, "best_model.pt"),
+            )
+        else:
+            patience_counter += 1
+            if patience_counter >= args.patience:
+                print(f"Early stopping at epoch {epoch}")
+                break
+
+    writer.close()
+
 
 if __name__ == "__main__":
-    # Parse command-line arguments for training configuration
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--data_dir",
-        type=str,
-        default="/home/gih5/mounts/nfs_echo_yale/031522_echo_avs_preprocessed",
-    )
+    parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--out_dir", type=str, required=True)
-    parser.add_argument("--model_name", type=str, required=True)
+    parser.add_argument("--experiment_name", type=str, required=True)
+    parser.add_argument("--backbone", type=str, default="r3d_18", choices=["r3d_18", "s3d", "r2plus1d_18", "mc3_18"])
 
-    parser.add_argument("--multi_instance", action="store_true", default=False)
-    parser.add_argument("--frame_reordering", action="store_true", default=False)
+    parser.add_argument("--multi_instance", action="store_true", default=True)
+    parser.add_argument("--frame_reordering", action="store_true", default=True)
 
-    parser.add_argument("--n_gpu", type=int, default=2)
-    parser.add_argument("--batch_size", type=int, default=196)
+    parser.add_argument("--n_gpu", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--temperature", type=float, default=0.05)
     parser.add_argument("--projection_dim", type=int, default=128)
     parser.add_argument("--lr", type=float, default=0.1)
     parser.add_argument("--num_epochs", type=int, default=300)
     parser.add_argument("--clip_len", type=int, default=4)
     parser.add_argument("--sampling_rate", type=int, default=1)
+    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--save_freq", type=int, default=10)
 
-    parser.add_argument("--save_freq", type=int, default=20)
     args = parser.parse_args()
-
     print(args)
-
-    # Start the self-supervised training process
     main(args)

@@ -43,6 +43,7 @@ dependencies = [
   "zarr>=3.0.0",
   "neurokit2>=0.2.13",
   "s3fs>=2026.2.0",
+  "tensorboard>=2.20.0",
 ]
 
 [project.urls]

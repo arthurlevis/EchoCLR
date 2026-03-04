@@ -47,3 +47,27 @@ class NT_Xent(torch.nn.Module):
         loss /= N
 
         return loss
+
+
+@torch.no_grad()
+def compute_val_loss(model, loader, loss_fxn, cls_loss_fxn, device, frame_reordering):
+    """Compute average loss over a dataloader (no gradients)."""
+    model.eval()
+    total_loss = 0.0
+    for batch in loader:
+        if frame_reordering:
+            x_i, x_j, t_i, t_j = batch
+            x_i, x_j = x_i.to(device), x_j.to(device)
+            t_i, t_j = t_i.to(device), t_j.to(device)
+            _, _, z_i, z_j, t_hat_i, t_hat_j = model(x_i, x_j)
+            loss = loss_fxn(z_i, z_j) + cls_loss_fxn(
+                torch.cat([t_hat_i, t_hat_j]), torch.cat([t_i, t_j])
+            )
+        else:
+            x_i, x_j = batch
+            x_i, x_j = x_i.to(device), x_j.to(device)
+            _, _, z_i, z_j = model(x_i, x_j)
+            loss = loss_fxn(z_i, z_j)
+        total_loss += loss.item()
+    model.train()
+    return total_loss / len(loader)
