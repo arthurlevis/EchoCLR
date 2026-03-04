@@ -115,16 +115,17 @@ def main(args):
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             
-            # Check for NaN gradients
-            nan_grads = False
+            # Check for NaN/Inf gradients
+            valid_grads = True
             for p in model.parameters():
-                if p.grad is not None and torch.isnan(p.grad).any():
-                    nan_grads = True
+                if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                    valid_grads = False
                     break
             
-            if nan_grads:
-                print(f"NaN gradients at batch {i}, skipping")
+            if not valid_grads:
+                print(f"Invalid gradients at batch {i}, skipping")
                 optimizer.zero_grad()
+                scaler.update()  # Must call update to reset scaler state
                 continue
                 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
