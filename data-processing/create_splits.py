@@ -37,16 +37,19 @@ def main():
 
     n_patients = len(patients)
     n_train = max(1, int(n_patients * args.train_ratio))
-    n_val = max(0, int(n_patients * args.val_ratio))
-    n_test = n_patients - n_train - n_val
-
+    n_remaining = n_patients - n_train
+    
     # Priority: train > val > test
-    if n_test < 0:
-        n_val = max(0, n_val + n_test)
-        n_test = 0
-    if n_val < 0:
+    if n_remaining == 0:
         n_val = 0
         n_test = 0
+    elif n_remaining == 1:
+        n_val = 1
+        n_test = 0
+    else:
+        val_ratio_adjusted = args.val_ratio / (args.val_ratio + (1 - args.train_ratio - args.val_ratio))
+        n_val = max(1, int(n_remaining * val_ratio_adjusted))
+        n_test = n_remaining - n_val
 
     train_patients = patients[:n_train]
     val_patients = patients[n_train:n_train + n_val]
