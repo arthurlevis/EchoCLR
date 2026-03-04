@@ -78,7 +78,7 @@ def main(args):
     print(model)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
     loss_fxn = NT_Xent(args.batch_size, args.temperature, world_size=args.n_gpu)
     cls_loss_fxn = torch.nn.CrossEntropyLoss() if args.frame_reordering else None
 
