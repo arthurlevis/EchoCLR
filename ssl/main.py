@@ -107,7 +107,13 @@ def main(args):
                     _, _, z_i, z_j = model(x_i, x_j)
                     loss = loss_fxn(z_i, z_j)
 
+            if torch.isnan(loss):
+                print(f"NaN loss at batch {i}, skipping")
+                continue
+
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
             running_loss += loss.item()
