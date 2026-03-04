@@ -1,6 +1,7 @@
 # Import required libraries for training, data loading, and model components
 import os
 import shutil
+import time
 
 import argparse
 import torch
@@ -15,6 +16,9 @@ from utils import seed_worker, set_seed
 
 
 def main(args):
+    torch.set_float32_matmul_precision('medium')
+    torch.backends.cudnn.benchmark = True
+    
     if not os.path.isdir(args.out_dir):
         os.mkdir(args.out_dir)
 
@@ -75,7 +79,8 @@ def main(args):
         model = torch.nn.DataParallel(model, device_ids=list(range(args.n_gpu))).to(device)
     else:
         model = model.to(device)
-    print(model)
+    
+    model = torch.compile(model)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scaler = torch.amp.GradScaler('cuda')
@@ -85,18 +90,33 @@ def main(args):
     best_val_loss = float("inf")
     patience_counter = 0
 
+    # Timing stats
+    time_data = 0.0
+    time_transfer = 0.0
+    time_forward = 0.0
+    time_backward = 0.0
+    timing_batches = 0
+
     for epoch in range(1, args.num_epochs + 1):
         model.train()
         running_loss = 0.0
         pbar = tqdm.tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch}")
+        batch_start = time.time()
 
         for i, batch in pbar:
+            t0 = time.time()
+            time_data += t0 - batch_start
+            
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast('cuda'):
                 if args.frame_reordering:
                     x_i, x_j, t_i, t_j = batch
                     x_i, x_j = x_i.to(device, non_blocking=True), x_j.to(device, non_blocking=True)
                     t_i, t_j = t_i.to(device, non_blocking=True), t_j.to(device, non_blocking=True)
+                    torch.cuda.synchronize()
+                    t1 = time.time()
+                    time_transfer += t1 - t0
+                    
                     _, _, z_i, z_j, t_hat_i, t_hat_j = model(x_i, x_j)
                     loss = loss_fxn(z_i, z_j) + cls_loss_fxn(
                         torch.cat([t_hat_i, t_hat_j]), torch.cat([t_i, t_j])
@@ -104,12 +124,21 @@ def main(args):
                 else:
                     x_i, x_j = batch
                     x_i, x_j = x_i.to(device, non_blocking=True), x_j.to(device, non_blocking=True)
+                    torch.cuda.synchronize()
+                    t1 = time.time()
+                    time_transfer += t1 - t0
+                    
                     _, _, z_i, z_j = model(x_i, x_j)
                     loss = loss_fxn(z_i, z_j)
+                
+                torch.cuda.synchronize()
+                t2 = time.time()
+                time_forward += t2 - t1
 
             if torch.isnan(loss):
-                print(f"NaN loss at batch {i}, skipping")
+                pbar.write(f"NaN loss at batch {i}, skipping")
                 optimizer.zero_grad()
+                batch_start = time.time()
                 continue
 
             scaler.scale(loss).backward()
@@ -123,23 +152,46 @@ def main(args):
                     break
             
             if not valid_grads:
-                print(f"Invalid gradients at batch {i}, skipping")
+                pbar.write(f"Invalid gradients at batch {i}, skipping")
+                if args.log_invalid_batches:
+                    start_idx = i * args.batch_size * args.n_gpu
+                    end_idx = start_idx + args.batch_size * args.n_gpu
+                    with open(os.path.join(model_dir, "invalid_batches.txt"), "a") as f:
+                        f.write(f"epoch={epoch} batch={i} indices={start_idx}-{end_idx}\n")
+                        for idx in range(start_idx, min(end_idx, len(train_dataset.fnames_i))):
+                            f.write(f"  {train_dataset.fnames_i[idx]}, {train_dataset.fnames_j[idx]}\n")
                 optimizer.zero_grad()
-                scaler.update()  # Must call update to reset scaler state
+                scaler.update()
+                batch_start = time.time()
                 continue
                 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
+            
+            torch.cuda.synchronize()
+            time_backward += time.time() - t2
+            timing_batches += 1
+            
             running_loss += loss.item()
+            global_step = (epoch - 1) * len(train_loader) + i
+            writer.add_scalar("train_iter_loss", loss.item(), global_step)
             pbar.set_postfix({"loss": running_loss / (i + 1)})
+            batch_start = time.time()
 
         train_loss = running_loss / len(train_loader)
         val_loss = compute_val_loss(model, val_loader, loss_fxn, cls_loss_fxn, device, args.frame_reordering)
 
-        writer.add_scalar("Loss/train", train_loss, epoch)
-        writer.add_scalar("Loss/val", val_loss, epoch)
-        print(f"Epoch {epoch}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}")
+        writer.add_scalar("train_loss", train_loss, epoch)
+        writer.add_scalar("val_loss", val_loss, epoch)
+        writer.add_scalar("learning_rate", optimizer.param_groups[0]['lr'], epoch)
+        
+        # Print timing stats
+        if timing_batches > 0:
+            print(f"Epoch {epoch}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}")
+            print(f"  Timing (avg ms): data={1000*time_data/timing_batches:.1f}, transfer={1000*time_transfer/timing_batches:.1f}, forward={1000*time_forward/timing_batches:.1f}, backward={1000*time_backward/timing_batches:.1f}")
+            time_data = time_transfer = time_forward = time_backward = 0.0
+            timing_batches = 0
 
         # Save checkpoint every save_freq epochs
         if epoch % args.save_freq == 0:
@@ -187,6 +239,7 @@ if __name__ == "__main__":
     parser.add_argument("--sampling_rate", type=int, default=1)
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--save_freq", type=int, default=10)
+    parser.add_argument("--log_invalid_batches", action="store_true")
 
     args = parser.parse_args()
     print(args)
