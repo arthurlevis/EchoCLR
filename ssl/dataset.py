@@ -147,8 +147,20 @@ class EchoDataset(torch.utils.data.Dataset):
             x_j = self._augment(x)
 
         # Min-max normalize and swap axes for PyTorch
-        x_i = (x_i - x_i.min()) / (x_i.max() - x_i.min())
-        x_j = (x_j - x_j.min()) / (x_j.max() - x_j.min())
+        eps = 1e-8
+        range_i = x_i.max() - x_i.min()
+        range_j = x_j.max() - x_j.min()
+        
+        # Skip normalization if constant (avoid NaN), just zero-center
+        if range_i < eps:
+            x_i = x_i - x_i.mean()
+        else:
+            x_i = (x_i - x_i.min()) / range_i
+            
+        if range_j < eps:
+            x_j = x_j - x_j.mean()
+        else:
+            x_j = (x_j - x_j.min()) / range_j
 
         x_i = np.transpose(x_i, (3, 0, 1, 2))  # (T,H,W,C) -> (C,T,H,W)
         x_j = np.transpose(x_j, (3, 0, 1, 2))
