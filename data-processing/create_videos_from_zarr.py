@@ -7,6 +7,9 @@ Output structure:
     ├── videos/
     │   ├── patient_001_clip_0.npy
     │   └── ...
+    ├── poses/
+    │   ├── patient_001_pose_0.npy  (6D: x,y,z,rx,ry,rz)
+    │   └── ...
     └── dataset.csv
 
 Run multiple times with different --input and --patient-id to build dataset incrementally.
@@ -32,6 +35,7 @@ from ecg_utils import (
 from s3_utils import open_zarr
 from image_processing import map_ultrasound_sectors_batch, resize_frames
 from empty_frame_filtering import detect_empty_frames
+from pose_utils import compute_relative_pose_6d
 
 # Suppress aiohttp unclosed connector warnings
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
@@ -40,7 +44,7 @@ warnings.filterwarnings("ignore", message="Unclosed connector")
 
 
 ECG_TOPIC = "ge_ultrasound_ecg_samples"
-CSV_COLUMNS = ["acc_num", "fpath", "plax_prob", "video_num", "label"]
+CSV_COLUMNS = ["acc_num", "fpath", "pose_fpath", "plax_prob", "video_num", "label"]
 
 
 def reconstruct_ecg_signal(
@@ -136,6 +140,7 @@ def main():
     parser.add_argument("--size", type=int, nargs=2, default=[112, 112], help="Output size (H W)")
     parser.add_argument("--sector-angle", type=float, default=35.0, help="Sector half-angle (degrees)")
     parser.add_argument("--save-empty-clips", action="store_true", help="Save clips with empty frames to empty/ folder")
+    parser.add_argument("--poses-only", action="store_true", help="Only extract poses, skip video processing")
     args = parser.parse_args()
 
     input_path = args.input  # Keep as string for S3 support
@@ -193,9 +198,21 @@ def main():
         print("ERROR: No valid clips found")
         return
 
+    # Extract pose data if available
+    pose_data = None
+    reference_pose = None
+    if "kinova_pose" in z:
+        pose_data = z["kinova_pose"]["data"][:]
+        reference_pose = pose_data[0]  # First frame as reference
+        print(f"Pose data: {pose_data.shape[0]} frames")
+
     # Create output directory
     videos_dir = output_path / "videos"
     videos_dir.mkdir(parents=True, exist_ok=True)
+    
+    if pose_data is not None:
+        poses_dir = output_path / "poses"
+        poses_dir.mkdir(parents=True, exist_ok=True)
 
     # Load existing dataset.csv or create new
     csv_path = output_path / "dataset.csv"
@@ -210,6 +227,36 @@ def main():
         empty_dir = output_path / "empty"
         empty_dir.mkdir(parents=True, exist_ok=True)
 
+    # Poses-only mode: just save poses for existing clips and update CSV
+    if args.poses_only:
+        if pose_data is None:
+            print("ERROR: No pose data in zarr")
+            return
+        print("Extracting poses only...")
+        n_saved = 0
+        pose_map = {}  # clip filename -> pose filename
+        for clip_idx, (start, end, subsample) in tqdm(enumerate(clip_indices), total=len(clip_indices), desc="Saving poses"):
+            last_frame_idx = end - 1
+            if last_frame_idx < pose_data.shape[0]:
+                rel_pose = compute_relative_pose_6d(pose_data[last_frame_idx], reference_pose)
+                pose_filename = f"{args.patient_id}_pose_{clip_idx}.npy"
+                np.save(str(poses_dir / pose_filename), rel_pose)
+                clip_filename = f"{args.patient_id}_clip_{clip_idx}.npy"
+                pose_map[clip_filename] = pose_filename
+                n_saved += 1
+        
+        # Update CSV with pose paths
+        if csv_path.exists() and pose_map:
+            df = pd.read_csv(csv_path)
+            if "pose_fpath" not in df.columns:
+                df["pose_fpath"] = None
+            df.loc[df["fpath"].isin(pose_map.keys()), "pose_fpath"] = df["fpath"].map(pose_map)
+            df.to_csv(csv_path, index=False)
+            print(f"Updated {csv_path.name} with pose paths")
+        
+        print(f"Saved {n_saved} poses to {poses_dir}")
+        return
+
     # Extract and save clips with prefetching
     print("Extracting, preprocessing, and saving clips...")
     new_records = []
@@ -221,13 +268,13 @@ def main():
         clip = np.array(obs_data[start:end:subsample])
         if clip.ndim == 4 and clip.shape[-1] == 1:
             clip = clip.squeeze(-1)
-        return clip_idx, clip, subsample
+        return clip_idx, clip, start, end, subsample
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         indexed_clips = list(enumerate(clip_indices))
         futures = iter(executor.map(fetch_clip, indexed_clips))
         
-        for clip_idx, clip, subsample in tqdm(futures, total=len(clip_indices), desc="Processing clips"):
+        for clip_idx, clip, start, end, subsample in tqdm(futures, total=len(clip_indices), desc="Processing clips"):
             # Apply polar sector transform
             clip = map_ultrasound_sectors_batch(clip, sector_half_angle_deg=args.sector_angle)
 
@@ -248,9 +295,19 @@ def main():
             np.save(str(videos_dir / filename), clip[..., np.newaxis])  # (T,H,W,1)
             # save_video(clip, str(videos_dir / filename.replace('.npy', '.avi')), fps=args.fps / subsample)
 
+            # Save pose (last frame, relative to first frame of zarr)
+            pose_filename = None
+            if pose_data is not None:
+                last_frame_idx = end - 1
+                if last_frame_idx < pose_data.shape[0]:
+                    rel_pose = compute_relative_pose_6d(pose_data[last_frame_idx], reference_pose)
+                    pose_filename = f"{args.patient_id}_pose_{clip_idx}.npy"
+                    np.save(str(poses_dir / pose_filename), rel_pose)
+
             new_records.append({
                 "acc_num": args.patient_id,
                 "fpath": filename,
+                "pose_fpath": pose_filename,
                 "plax_prob": 1.0,
                 "video_num": clip_idx,
                 "label": 0,
