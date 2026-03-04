@@ -15,6 +15,7 @@ Run multiple times with different --input and --patient-id to build dataset incr
 import argparse
 import logging
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -152,6 +153,7 @@ def main():
         raise ValueError("No observation data found in zarr")
 
     obs_data = z[obs_key]["data"]
+    # print(f"chunks: {obs_data.chunks}")  # ⚠️ NOTE: raw zarrs not created with same chunk size.
     total_frames = obs_data.shape[0]
     frame_offset = 0
 
@@ -172,8 +174,8 @@ def main():
     print("Extracting ECG signal...")
     ecg_times, ecg_amplitudes = extract_ecg_from_zarr(z)
     print(f"ECG signal: {len(ecg_times)} samples")
-    print(f"ECG time range: {ecg_times[0]:.2f} - {ecg_times[-1]:.2f} s")
-    print(f"ECG amplitude range: {ecg_amplitudes.min():.2f} - {ecg_amplitudes.max():.2f}")
+    # print(f"ECG time range: {ecg_times[0]:.2f} - {ecg_times[-1]:.2f} s")
+    print(f"ECG duration: {ecg_times[-1] - ecg_times[0]:.2f} s")
 
     print("Detecting R-peaks with neurokit2...")
     r_peak_times = detect_r_peaks_neurokit(ecg_times, ecg_amplitudes)
@@ -208,43 +210,49 @@ def main():
         empty_dir = output_path / "empty"
         empty_dir.mkdir(parents=True, exist_ok=True)
 
-    # Extract and save clips
+    # Extract and save clips with prefetching
     print("Extracting, preprocessing, and saving clips...")
     new_records = []
     n_skipped = 0
     output_size = tuple(args.size)
 
-    for clip_idx, (start, end, subsample) in enumerate(tqdm(clip_indices, desc="Processing clips")):
-        clip = obs_data[start:end:subsample]
-
+    def fetch_clip(idx_and_bounds):
+        clip_idx, (start, end, subsample) = idx_and_bounds
+        clip = np.array(obs_data[start:end:subsample])
         if clip.ndim == 4 and clip.shape[-1] == 1:
             clip = clip.squeeze(-1)
+        return clip_idx, clip, subsample
 
-        # Apply polar sector transform
-        clip = map_ultrasound_sectors_batch(clip, sector_half_angle_deg=args.sector_angle)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        indexed_clips = list(enumerate(clip_indices))
+        futures = iter(executor.map(fetch_clip, indexed_clips))
+        
+        for clip_idx, clip, subsample in tqdm(futures, total=len(clip_indices), desc="Processing clips"):
+            # Apply polar sector transform
+            clip = map_ultrasound_sectors_batch(clip, sector_half_angle_deg=args.sector_angle)
 
-        # Resize to target size
-        clip = resize_frames(clip, output_size)
+            # Resize to target size
+            clip = resize_frames(clip, output_size)
 
-        # Filter empty frames
-        is_empty = detect_empty_frames(clip)
-        if is_empty.any():
-            n_skipped += 1
-            if args.save_empty_clips:
-                filename = f"{args.patient_id}_clip_{clip_idx}.avi"
-                save_video(clip, str(empty_dir / filename), fps=args.fps / subsample)
-            continue
+            # Filter empty frames
+            is_empty = detect_empty_frames(clip)
+            if is_empty.any():
+                n_skipped += 1
+                if args.save_empty_clips:
+                    filename = f"{args.patient_id}_clip_{clip_idx}.avi"
+                    save_video(clip, str(empty_dir / filename), fps=args.fps / subsample)
+                continue
 
-        filename = f"{args.patient_id}_clip_{clip_idx}.avi"
-        save_video(clip, str(videos_dir / filename), fps=args.fps / subsample)
+            filename = f"{args.patient_id}_clip_{clip_idx}.avi"
+            save_video(clip, str(videos_dir / filename), fps=args.fps / subsample)
 
-        new_records.append({
-            "acc_num": args.patient_id,
-            "fpath": filename,
-            "plax_prob": 1.0,
-            "video_num": clip_idx,
-            "label": 0,
-        })
+            new_records.append({
+                "acc_num": args.patient_id,
+                "fpath": filename,
+                "plax_prob": 1.0,
+                "video_num": clip_idx,
+                "label": 0,
+            })
 
     # Append to dataset.csv
     new_df = pd.DataFrame(new_records, columns=CSV_COLUMNS)
