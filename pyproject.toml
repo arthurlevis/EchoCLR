@@ -44,6 +44,7 @@ dependencies = [
   "neurokit2>=0.2.13",
   "s3fs>=2026.2.0",
   "tensorboard>=2.20.0",
+  "kornia>=0.8.2",
 ]
 
 [project.urls]

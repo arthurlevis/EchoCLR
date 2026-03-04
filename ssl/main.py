@@ -36,6 +36,9 @@ def main(args):
         num_workers=12,
         worker_init_fn=seed_worker,
         drop_last=True,
+        pin_memory=True,
+        prefetch_factor=2,
+        persistent_workers=True,
     )
     train_dataset = EchoDataset(
         data_dir=args.data_dir, split="train", clip_len=args.clip_len,
@@ -75,6 +78,7 @@ def main(args):
     print(model)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    scaler = torch.cuda.amp.GradScaler()
     loss_fxn = NT_Xent(args.batch_size, args.temperature, world_size=args.n_gpu)
     cls_loss_fxn = torch.nn.CrossEntropyLoss() if args.frame_reordering else None
 
@@ -87,23 +91,25 @@ def main(args):
         pbar = tqdm.tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch}")
 
         for i, batch in pbar:
-            if args.frame_reordering:
-                x_i, x_j, t_i, t_j = batch
-                x_i, x_j = x_i.to(device), x_j.to(device)
-                t_i, t_j = t_i.to(device), t_j.to(device)
-                _, _, z_i, z_j, t_hat_i, t_hat_j = model(x_i, x_j)
-                loss = loss_fxn(z_i, z_j) + cls_loss_fxn(
-                    torch.cat([t_hat_i, t_hat_j]), torch.cat([t_i, t_j])
-                )
-            else:
-                x_i, x_j = batch
-                x_i, x_j = x_i.to(device), x_j.to(device)
-                _, _, z_i, z_j = model(x_i, x_j)
-                loss = loss_fxn(z_i, z_j)
-
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
+            with torch.autocast('cuda'):
+                if args.frame_reordering:
+                    x_i, x_j, t_i, t_j = batch
+                    x_i, x_j = x_i.to(device, non_blocking=True), x_j.to(device, non_blocking=True)
+                    t_i, t_j = t_i.to(device, non_blocking=True), t_j.to(device, non_blocking=True)
+                    _, _, z_i, z_j, t_hat_i, t_hat_j = model(x_i, x_j)
+                    loss = loss_fxn(z_i, z_j) + cls_loss_fxn(
+                        torch.cat([t_hat_i, t_hat_j]), torch.cat([t_i, t_j])
+                    )
+                else:
+                    x_i, x_j = batch
+                    x_i, x_j = x_i.to(device, non_blocking=True), x_j.to(device, non_blocking=True)
+                    _, _, z_i, z_j = model(x_i, x_j)
+                    loss = loss_fxn(z_i, z_j)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             running_loss += loss.item()
             pbar.set_postfix({"loss": running_loss / (i + 1)})
 

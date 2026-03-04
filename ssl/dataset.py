@@ -9,7 +9,8 @@ import pandas as pd
 import torch
 import tqdm
 
-from scipy.ndimage import rotate
+from scipy.ndimage import rotate as scipy_rotate
+import kornia.geometry.transform as K
 
 from utils import load_video
 
@@ -92,13 +93,15 @@ class EchoDataset(torch.utils.data.Dataset):
 
         if random.uniform(0, 1) > 0.5:
             # Random horizontal flip
-            x = np.stack([cv2.flip(frame, 1) for frame in x], axis=0)
+            x = np.flip(x, axis=2).copy()  # flip along W axis
 
         if random.uniform(0, 1) > 0.5:
-            # Random rotation between -10, 10 degrees
-            angle = np.random.choice(np.arange(-10, 11), size=1)[0]
-
-            x = np.stack([rotate(frame, angle, reshape=False) for frame in x], axis=0)
+            # Random rotation between -10, 10 degrees (kornia)
+            angle = float(np.random.choice(np.arange(-10, 11), size=1)[0])
+            x_t = torch.from_numpy(x).permute(0, 3, 1, 2).float()  # (T,H,W,C) -> (T,C,H,W)
+            x_t = K.rotate(x_t, torch.tensor(angle))
+            x = x_t.permute(0, 2, 3, 1).numpy()
+            # x = np.stack([scipy_rotate(frame, angle, reshape=False) for frame in x], axis=0)
 
         if self.frame_reordering:
             # Frame re-ordering
@@ -147,8 +150,13 @@ class EchoDataset(torch.utils.data.Dataset):
         x_i = (x_i - x_i.min()) / (x_i.max() - x_i.min())
         x_j = (x_j - x_j.min()) / (x_j.max() - x_j.min())
 
-        x_i = np.transpose(x_i, (3, 0, 1, 2))
+        x_i = np.transpose(x_i, (3, 0, 1, 2))  # (T,H,W,C) -> (C,T,H,W)
         x_j = np.transpose(x_j, (3, 0, 1, 2))
+
+        # Repeat grayscale to 3 channels for pretrained model compatibility
+        if x_i.shape[0] == 1:
+            x_i = np.repeat(x_i, 3, axis=0)
+            x_j = np.repeat(x_j, 3, axis=0)
 
         if self.frame_reordering:
             return (

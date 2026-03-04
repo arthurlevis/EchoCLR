@@ -25,6 +25,15 @@ def set_seed(seed):
 def load_video(fpath):
     if not os.path.exists(fpath):
         raise FileNotFoundError(fpath)
+    
+    # Numpy format (faster loading)
+    if fpath.endswith('.npy'):
+        v = np.load(fpath)
+        if v.ndim != 4:
+            raise ValueError(f"Expected (T,H,W,C) array, got shape {v.shape}")
+        return v
+    
+    # AVI format (legacy)
     capture = cv2.VideoCapture(fpath)
 
     frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
