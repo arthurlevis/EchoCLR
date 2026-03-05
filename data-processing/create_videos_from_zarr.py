@@ -45,7 +45,7 @@ warnings.filterwarnings("ignore", message="Unclosed connector")
 
 
 ECG_TOPIC = "ge_ultrasound_ecg_samples"
-CSV_COLUMNS = ["acc_num", "fpath", "pose_fpath", "plax_prob", "video_num", "label"]
+CSV_COLUMNS = ["acc_num", "fpath", "pose_idx", "plax_prob", "video_num", "label"]
 
 
 def reconstruct_ecg_signal(
@@ -130,17 +130,23 @@ def get_frame_timestamps(zarr: zarr.Group, obs_key: str) -> np.ndarray:
     return np.arange(total_frames) / 30.0
 
 
+def compute_fps(timestamps: np.ndarray) -> float:
+    """Compute FPS from frame timestamps."""
+    dt = np.diff(timestamps)
+    return 1.0 / np.median(dt)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Create videos from zarr")
     parser.add_argument("--input", required=True, help="Input zarr path")
     parser.add_argument("--output", required=True, help="Output directory")
     parser.add_argument("--patient-id", required=True, help="Patient ID")
-    parser.add_argument("--subsample", type=int, default=1, help="Take every Nth frame")
-    parser.add_argument("--fps", type=float, default=55.0, help="Output video FPS")
-    parser.add_argument("--num-samples", type=int, default=None, help="Use first N frames (for testing)")
     parser.add_argument("--size", type=int, nargs=2, default=[112, 112], help="Output size (H W)")
     parser.add_argument("--sector-angle", type=float, default=35.0, help="Sector half-angle (degrees)")
-    parser.add_argument("--save-empty-clips", action="store_true", help="Save clips with empty frames to empty/ folder")
+    parser.add_argument("--subsample", type=int, default=1, help="Take every Nth frame")
+    parser.add_argument("--num-samples", type=int, default=None, help="Use first N frames (for testing)")
+    parser.add_argument("--save-clips-avi", action="store_true", help="Save AVI videos alongside memmap files (for debugging)")
+    parser.add_argument("--save-empty-clips", action="store_true", help="Save clips with empty frames to empty/ folder (for debugging)")
     parser.add_argument("--poses-only", action="store_true", help="Only extract poses, skip video processing")
     args = parser.parse_args()
 
@@ -169,10 +175,10 @@ def main():
         if args.num_samples < 0:
             frame_offset = max(0, total_frames - n)
             total_frames = min(n, total_frames)
-            print(f"Using last {total_frames} frames (--num-samples)")
+            print(f"Using last {total_frames} frames")
         else:
             total_frames = min(total_frames, n)
-            print(f"Using first {total_frames} frames (--num-samples)")
+            print(f"Using first {total_frames} frames")
     else:
         print(f"Zarr has {total_frames} frames")
 
@@ -180,7 +186,6 @@ def main():
     print("Extracting ECG signal...")
     ecg_times, ecg_amplitudes = extract_ecg_from_zarr(z)
     print(f"ECG signal: {len(ecg_times)} samples")
-    # print(f"ECG time range: {ecg_times[0]:.2f} - {ecg_times[-1]:.2f} s")
     print(f"ECG duration: {ecg_times[-1] - ecg_times[0]:.2f} s")
 
     print("Detecting R-peaks with neurokit2...")
@@ -189,6 +194,9 @@ def main():
 
     # Get frame timestamps and compute clip indices
     frame_timestamps = get_frame_timestamps(z, obs_key)
+    fps = compute_fps(frame_timestamps)
+    print(f"Computed FPS: {fps:.1f}")
+    
     clip_indices = compute_clip_indices_between_peaks(
         r_peak_times, frame_timestamps, subsample=args.subsample
     )
@@ -262,8 +270,9 @@ def main():
         return
 
     # Extract and save clips with prefetching
-    print("Extracting, preprocessing, and saving clips...")
     new_records = []
+    all_clips = []  # Accumulate clips for concatenated memmap
+    all_poses = []  # Accumulate poses for concatenated memmap
     n_skipped = 0
     output_size = tuple(args.size)
 
@@ -278,7 +287,7 @@ def main():
         indexed_clips = list(enumerate(clip_indices))
         futures = iter(executor.map(fetch_clip, indexed_clips))
         
-        for clip_idx, clip, start, end, subsample in tqdm(futures, total=len(clip_indices), desc="Processing clips"):
+        for clip_idx, clip, start, end, subsample in tqdm(futures, total=len(clip_indices), desc="Fetching & Processing clips"):
             # Apply polar sector transform
             clip = map_ultrasound_sectors_batch(clip, sector_half_angle_deg=args.sector_angle)
 
@@ -290,34 +299,108 @@ def main():
             if is_empty.any():
                 n_skipped += 1
                 if args.save_empty_clips:
-                    save_video(clip, str(empty_dir / f"{args.patient_id}_clip_{clip_idx}.avi"), fps=args.fps / subsample)
+                    save_video(clip, str(empty_dir / f"{args.patient_id}_clip_{clip_idx}.avi"), fps=fps / subsample)
                 continue
 
-            filename = f"{args.patient_id}_clip_{clip_idx}.npy"
-            np.save(str(videos_dir / filename), clip[..., np.newaxis])  # (T,H,W,1)
+            clip_with_channel = clip[..., np.newaxis].astype(np.uint8)  # (T,H,W,1)
+            all_clips.append(clip_with_channel)
             
-            # Also save AVI for debugging
-            avi_dir = output_path / "videos-avi"
-            avi_dir.mkdir(parents=True, exist_ok=True)
-            save_video(clip, str(avi_dir / f"{args.patient_id}_clip_{clip_idx}.avi"), fps=args.fps / subsample)
+            # Save AVI for debugging if requested
+            if args.save_clips_avi:
+                avi_dir = output_path / "videos-avi"
+                avi_dir.mkdir(parents=True, exist_ok=True)
+                save_video(clip, str(avi_dir / f"{args.patient_id}_clip_{clip_idx}.avi"), fps=fps / subsample)
 
-            # Save pose (last frame, relative to first frame of zarr)
-            pose_filename = None
+            # Collect pose (last frame, relative to first frame of zarr)
+            pose_idx = None
             if pose_data is not None:
                 last_frame_idx = end - 1
                 if last_frame_idx < pose_data.shape[0]:
                     rel_pose = compute_relative_pose_6d(pose_data[last_frame_idx], reference_pose)
-                    pose_filename = f"{args.patient_id}_pose_{clip_idx}.npy"
-                    np.save(str(poses_dir / pose_filename), rel_pose)
+                    all_poses.append(rel_pose)
+                    pose_idx = len(all_poses) - 1
 
             new_records.append({
                 "acc_num": args.patient_id,
-                "fpath": filename,
-                "pose_fpath": pose_filename,
+                "fpath": len(all_clips) - 1,  # Index into concatenated clips
+                "pose_idx": pose_idx,  # Index into concatenated poses (None if no pose)
                 "plax_prob": 1.0,
                 "video_num": clip_idx,
                 "label": 0,
             })
+
+    # Build concatenated memmap for clips
+    if all_clips:
+        clips_dat = videos_dir / "clips.dat"
+        index_npy = videos_dir / "clips_index.npy"
+        
+        if clips_dat.exists() and index_npy.exists():
+            old_index = np.load(index_npy)
+            old_total_frames = old_index[-1, 1] if len(old_index) > 0 else 0
+        else:
+            old_index = np.empty((0, 2), dtype=np.int64)
+            old_total_frames = 0
+        
+        # Build index for new clips
+        new_index = []
+        frame_offset = old_total_frames
+        for clip in all_clips:
+            n_frames = clip.shape[0]
+            new_index.append([frame_offset, frame_offset + n_frames])
+            frame_offset += n_frames
+        new_index = np.array(new_index, dtype=np.int64)
+        
+        # Concatenate all new clips
+        new_frames = np.concatenate(all_clips, axis=0)
+        total_new_frames = new_frames.shape[0]
+        
+        # Write to memmap (append mode)
+        H, W = output_size
+        if clips_dat.exists():
+            new_mmap = np.memmap(str(clips_dat), dtype=np.uint8, mode='r+', shape=(old_total_frames + total_new_frames, H, W, 1))
+            new_mmap[old_total_frames:] = new_frames
+        else:
+            new_mmap = np.memmap(str(clips_dat), dtype=np.uint8, mode='w+', shape=(total_new_frames, H, W, 1))
+            new_mmap[:] = new_frames
+        new_mmap.flush()
+        del new_mmap
+        
+        # Save combined index
+        combined_index = np.concatenate([old_index, new_index], axis=0)
+        np.save(index_npy, combined_index)
+        
+        # Update fpath in records to be global index
+        base_clip_idx = len(old_index)
+        for i, rec in enumerate(new_records):
+            rec["fpath"] = base_clip_idx + i
+
+    # Build concatenated array for poses
+    if all_poses:
+        poses_dat = poses_dir / "poses.dat"
+        
+        if poses_dat.exists():
+            old_poses = np.memmap(str(poses_dat), dtype=np.float32, mode='r').reshape(-1, 6)
+            old_n_poses = old_poses.shape[0]
+        else:
+            old_n_poses = 0
+        
+        new_poses = np.array(all_poses, dtype=np.float32)
+        total_poses = old_n_poses + len(new_poses)
+        
+        # Write to memmap
+        if poses_dat.exists():
+            poses_mmap = np.memmap(str(poses_dat), dtype=np.float32, mode='r+', shape=(total_poses, 6))
+            poses_mmap[old_n_poses:] = new_poses
+        else:
+            poses_mmap = np.memmap(str(poses_dat), dtype=np.float32, mode='w+', shape=(total_poses, 6))
+            poses_mmap[:] = new_poses
+        poses_mmap.flush()
+        del poses_mmap
+        
+        # Update pose_idx in records to be global index
+        for rec in new_records:
+            if rec["pose_idx"] is not None:
+                rec["pose_idx"] = old_n_poses + rec["pose_idx"]
 
     # Append to dataset.csv
     new_df = pd.DataFrame(new_records, columns=CSV_COLUMNS)

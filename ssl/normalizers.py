@@ -5,22 +5,26 @@ import numpy as np
 import pandas as pd
 import tqdm
 
-from utils import load_video
-
 
 def compute_clip_stats(data_dir, split="train", sample_size=1000):
-    """Compute global mean/std from training set for z-score normalization."""
+    """Compute global mean/std from concatenated memmap."""
     video_dir = os.path.join(data_dir, "videos")
-    label_df = pd.read_csv(os.path.join(data_dir, split + ".csv"))
+    index_npy = os.path.join(video_dir, "clips_index.npy")
+    clips_dat = os.path.join(video_dir, "clips.dat")
     
-    fnames = label_df["fpath"].values
-    if len(fnames) > sample_size:
-        fnames = np.random.choice(fnames, sample_size, replace=False)
+    clip_index = np.load(index_npy)
+    total_frames = clip_index[-1, 1]
+    clips_mmap = np.memmap(clips_dat, dtype=np.uint8, mode='r', shape=(total_frames, 112, 112, 1))
+    
+    # Sample random clips
+    n_clips = len(clip_index)
+    sample_indices = np.random.choice(n_clips, min(sample_size, n_clips), replace=False)
     
     pixels = []
-    for fname in tqdm.tqdm(fnames, desc="Computing clip stats"):
-        x = load_video(os.path.join(video_dir, fname))
-        pixels.append(x.flatten().astype(np.float32) / 255.0)
+    for idx in tqdm.tqdm(sample_indices, desc="Computing clip stats"):
+        start, end = clip_index[idx]
+        clip = clips_mmap[start:end]
+        pixels.append(clip.flatten().astype(np.float32) / 255.0)
     
     all_pixels = np.concatenate(pixels)
     return float(all_pixels.mean()), float(all_pixels.std())

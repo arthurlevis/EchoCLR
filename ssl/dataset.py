@@ -12,8 +12,6 @@ import tqdm
 from scipy.ndimage import rotate as scipy_rotate
 import kornia.geometry.transform as K
 
-from utils import load_video
-
 
 class EchoDataset(torch.utils.data.Dataset):
     def __init__(
@@ -41,15 +39,18 @@ class EchoDataset(torch.utils.data.Dataset):
         self.mean = mean
         self.std = std
 
-        # assert not ((not multi_instance) and frame_reordering), (
-        #     "frame_reordering can only be enabled when multi_instance is enabled"
-        # )
-
         self.video_dir = os.path.join(data_dir, "videos")
         self.label_df = pd.read_csv(os.path.join(data_dir, self.split + ".csv"))
 
         if n is not None:
             self.label_df = self.label_df.iloc[:n, :]
+
+        # Load concatenated memmap and index
+        clips_dat = os.path.join(self.video_dir, "clips.dat")
+        index_npy = os.path.join(self.video_dir, "clips_index.npy")
+        self.clip_index = np.load(index_npy)
+        total_frames = self.clip_index[-1, 1]
+        self.clips_mmap = np.memmap(clips_dat, dtype=np.uint8, mode='r', shape=(total_frames, 112, 112, 1))
 
         self.study_ids = np.sort(self.label_df["acc_num"].unique())
 
@@ -57,22 +58,27 @@ class EchoDataset(torch.utils.data.Dataset):
             self.fnames_i = []
             self.fnames_j = []
             for study_id in tqdm.tqdm(self.study_ids):
-                fnames = self.label_df[self.label_df["acc_num"] == study_id][
+                clip_indices = self.label_df[self.label_df["acc_num"] == study_id][
                     "fpath"
                 ].values.tolist()
 
-                if len(fnames) == 1:
-                    self.fnames_i.append(fnames[0])
-                    self.fnames_j.append(fnames[0])
+                if len(clip_indices) == 1:
+                    self.fnames_i.append(clip_indices[0])
+                    self.fnames_j.append(clip_indices[0])
                 else:
-                    for fname_pair in itertools.combinations(fnames, 2):
-                        self.fnames_i.append(fname_pair[0])
-                        self.fnames_j.append(fname_pair[1])
+                    for idx_pair in itertools.combinations(clip_indices, 2):
+                        self.fnames_i.append(idx_pair[0])
+                        self.fnames_j.append(idx_pair[1])
 
             if self.frame_reordering:
                 self.temporal_orderings = [
                     _ for _ in itertools.permutations(np.arange(self.clip_len))
                 ]
+
+    def _load_clip(self, idx):
+        """Load clip from concatenated memmap by index."""
+        start, end = self.clip_index[idx]
+        return np.array(self.clips_mmap[start:end])  # Copy for augmentation
 
     def _sample_frames(self, x):
         if x.shape[0] > self.clip_len * self.sampling_rate:
@@ -125,8 +131,8 @@ class EchoDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         if self.multi_instance:
-            x_i = load_video(os.path.join(self.video_dir, self.fnames_i[idx]))
-            x_j = load_video(os.path.join(self.video_dir, self.fnames_j[idx]))
+            x_i = self._load_clip(self.fnames_i[idx])
+            x_j = self._load_clip(self.fnames_j[idx])
 
             # Sample frames to form clip from each "view"
             x_i = self._sample_frames(x_i)
@@ -142,8 +148,8 @@ class EchoDataset(torch.utils.data.Dataset):
                 x_i = self._augment(x_i)
                 x_j = self._augment(x_j)
         else:
-            plax_prob, fname, acc_num, label, video_num = self.label_df.iloc[idx, :]
-            x = load_video(os.path.join(self.video_dir, fname))
+            clip_idx = self.label_df.iloc[idx]["fpath"]
+            x = self._load_clip(clip_idx)
 
             x = self._sample_frames(x)
 
