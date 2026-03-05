@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-Create videos from zarr file and append to dataset.csv.
+Create ECG-gated video clips from zarr recordings.
+
+Extracts clips between R-peaks, applies polar sector transform, and saves to
+concatenated memmap files for fast training data loading.
 
 Output structure:
     output_dir/
     ├── videos/
-    │   ├── patient_001_clip_0.npy
-    │   └── ...
+    │   ├── clips.dat         # All frames concatenated (N_frames, 112, 112, 1) uint8
+    │   └── clips_index.npy   # (N_clips, 2) [start, end] frame indices
     ├── poses/
-    │   ├── patient_001_pose_0.npy  (6D: x,y,z,rx,ry,rz)
-    │   └── ...
-    └── dataset.csv
+    │   └── poses.dat         # All poses (N_poses, 6) float32 [x,y,z,rx,ry,rz]
+    ├── videos-avi/           # Optional: AVI files for debugging (--save-clips-avi)
+    ├── empty/                # Optional: Empty clips for debugging (--save-empty-clips)
+    └── dataset.csv           # Columns: acc_num, fpath (clip_idx), pose_idx, plax_prob, video_num, label
 
 Run multiple times with different --input and --patient-id to build dataset incrementally.
 """

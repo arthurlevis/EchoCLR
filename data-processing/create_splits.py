@@ -3,6 +3,10 @@
 Create train/val/test splits from dataset.csv.
 
 Splits at patient level (acc_num) to avoid data leakage.
+Outputs train.csv, val.csv, test.csv with same columns as dataset.csv.
+
+Note: Clip and pose data remain in shared memmap files (clips.dat, poses.dat).
+Split CSVs just reference different subsets of indices.
 """
 
 import argparse
