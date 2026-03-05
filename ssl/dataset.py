@@ -25,6 +25,8 @@ class EchoDataset(torch.utils.data.Dataset):
         multi_instance=False,
         frame_reordering=False,
         n=None,
+        mean=None,
+        std=None,
     ):
         assert split in ["train", "val", "test", "ext_test"], (
             "split must be one of ['train', 'val', 'test', 'ext_test']"
@@ -36,6 +38,8 @@ class EchoDataset(torch.utils.data.Dataset):
         self.sampling_rate = sampling_rate
         self.multi_instance = multi_instance
         self.frame_reordering = frame_reordering
+        self.mean = mean
+        self.std = std
 
         # assert not ((not multi_instance) and frame_reordering), (
         #     "frame_reordering can only be enabled when multi_instance is enabled"
@@ -146,21 +150,12 @@ class EchoDataset(torch.utils.data.Dataset):
             x_i = self._augment(x)
             x_j = self._augment(x)
 
-        # Min-max normalize and swap axes for PyTorch
-        eps = 1e-8
-        range_i = x_i.max() - x_i.min()
-        range_j = x_j.max() - x_j.min()
-        
-        # Skip normalization if constant (avoid NaN), just zero-center
-        if range_i < eps:
-            x_i = x_i - x_i.mean()
-        else:
-            x_i = (x_i - x_i.min()) / range_i
-            
-        if range_j < eps:
-            x_j = x_j - x_j.mean()
-        else:
-            x_j = (x_j - x_j.min()) / range_j
+        # Global z-score normalize
+        x_i = x_i.astype(np.float32) / 255.0
+        x_j = x_j.astype(np.float32) / 255.0
+        if self.mean is not None and self.std is not None:
+            x_i = (x_i - self.mean) / self.std
+            x_j = (x_j - self.mean) / self.std
 
         x_i = np.transpose(x_i, (3, 0, 1, 2))  # (T,H,W,C) -> (C,T,H,W)
         x_j = np.transpose(x_j, (3, 0, 1, 2))

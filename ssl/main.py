@@ -10,6 +10,7 @@ import tqdm
 from torch.utils.tensorboard import SummaryWriter
 
 from dataset import EchoDataset
+from normalizers import compute_clip_stats
 from losses import NT_Xent, compute_val_loss
 from model import SimCLR
 from utils import seed_worker, set_seed
@@ -44,15 +45,21 @@ def main(args):
         prefetch_factor=2,
         persistent_workers=True,
     )
+    
+    # Compute global normalization stats from training set
+    print("Computing dataset statistics...")
+    mean, std = compute_clip_stats(args.data_dir, split="train")
+    print(f"Dataset stats: mean={mean:.4f}, std={std:.4f}")
+    
     train_dataset = EchoDataset(
         data_dir=args.data_dir, split="train", clip_len=args.clip_len,
         sampling_rate=args.sampling_rate, multi_instance=args.multi_instance,
-        frame_reordering=args.frame_reordering,
+        frame_reordering=args.frame_reordering, mean=mean, std=std,
     )
     val_dataset = EchoDataset(
         data_dir=args.data_dir, split="val", clip_len=args.clip_len,
         sampling_rate=args.sampling_rate, multi_instance=args.multi_instance,
-        frame_reordering=args.frame_reordering,
+        frame_reordering=args.frame_reordering, mean=mean, std=std,
     )
     train_loader = torch.utils.data.DataLoader(train_dataset, shuffle=True, **loader_kwargs)
     val_loader = torch.utils.data.DataLoader(val_dataset, shuffle=False, **loader_kwargs)
